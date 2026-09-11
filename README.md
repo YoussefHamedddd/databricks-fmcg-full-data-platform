@@ -1,95 +1,116 @@
-# FMCG Data Consolidation Platform
 
-A Databricks lakehouse project that integrates an acquired company's data into its parent company's analytical model using AWS S3, PySpark, Spark SQL, and Delta Lake. The implementation covers historical loading, incremental order processing, data standardization, monthly consolidation, and sales analytics.
+## Databricks Workflow
 
-## Business Problem
+![Databricks pipeline workflow](docs/images/databricks_pipeline_workflow.png)
 
-A parent company has acquired a child company, Sports Bar. The parent already has an established reporting model containing customers, products, prices, and monthly sales. The acquired company supplies separate CSV datasets with different field names, inconsistent values, and orders recorded at a more detailed, daily level.
+The captured workflow shows customer, pricing, and product tasks feeding the incremental orders task. All four tasks completed successfully in the displayed run.
 
-The business needs to bring the child's data into the parent's model and keep that consolidated model current as new child data arrives. New business keys must be inserted, while records matching existing merge keys must be updated. Reporting should then cover the combined business, including the acquisition channel.
+The dimension tasks use their existing full-refresh notebooks even when included in the incremental orders workflow. Their presence in that job does not make dimension processing incremental.
 
-This requires more than copying files. The pipeline must clean source data, map child attributes to the parent's schema, resolve product identifiers, and aggregate child orders to the same monthly grain used by the parent.
+For an initial deployment, run products before pricing because pricing reads `fmcg.silver.products`. The screenshot shows those tasks in parallel, so reproducing that arrangement assumes the product table is already available. Configure an explicit product-to-pricing dependency when the price task must use the products refreshed in the same run.
 
-## Architecture
+The repository includes notebooks and workflow evidence, but no exported job definition; configure task dependencies in the target Databricks workspace.
 
-![Data platform architecture](docs/images/data_platform_architecture.png)
+## Analytical Model
 
-The platform follows a Bronze, Silver, and Gold architecture:
+![Power BI data model](docs/images/power_bi_data_model.png)
 
-| Component | Responsibility |
+The consolidated reporting model centers on `fact_orders` and uses four dimensions:
+
+| Table | Reporting purpose |
 | --- | --- |
-| Source datasets | CSV extracts for customers, products, gross prices, and orders |
-| AWS S3 | Stores incoming child files and archives ingested order files |
-| Bronze | Retains raw records with ingestion timestamps and source-file metadata |
-| Silver | Applies cleaning, deduplication, date parsing, and product mapping |
-| Child Gold | Exposes standardized child dimensions and detailed child orders |
-| Consolidated Gold | Merges child data into parent dimensions and monthly order facts |
-| Serving layer | Provides an enriched SQL view, a Power BI model, sales dashboards, and Genie analysis |
+| `fact_orders` | Monthly sold quantity by product and customer |
+| `dim_date` | Month, quarter, and year filtering |
+| `dim_customers` | Customer, market, platform, and channel analysis |
+| `dim_products` | Product, category, division, and variant analysis |
+| `dim_gross_price` | Product pricing by year |
 
-The notebooks use the `fmcg` catalog with `bronze`, `silver`, and `gold` schemas. Some screenshots and an alternative SQL script use `arc`; those names refer to a different workspace configuration. The table references below follow the notebooks.
+The Power BI screenshot shows a `ProductYear` relationship for pricing. The enriched SQL view expresses the same product-and-year lookup using `product_code` and `YEAR(date)`.
 
-The repository implements batch ingestion from CSV files. The source-system extraction shown in the diagram is the upstream context; a live OLTP extraction connector is not included.
+The serving query in [denormalise_table_query_fmcg.txt](project-de-fmcg-atlikon/2_dashboarding/denormalise_table_query_fmcg.txt) creates `fmcg.gold.vw_fact_orders_enriched`. It left-joins the monthly fact to the dimensions and calculates:
 
-## AWS S3: Landing and Persistent File Storage
-
-![AWS S3 order landing and processed folders](docs/images/aws_s3_data_landing.png)
-
-The order pipeline separates incoming files from files already ingested:
-
-```text
-s3://<your-bucket>/
-    customers/
-        customers.csv
-    products/
-        products.csv
-    gross_price/
-        gross_price.csv
-    orders/
-        landing/
-            orders_YYYY_MM_DD.csv
-        processed/
-            orders_YYYY_MM_DD.csv
+```sql
+fo.sold_quantity * gp.price_inr AS total_amount_inr
 ```
 
-`landing/` is the entry point for new order files. The notebooks read its CSV files, add metadata, and write the raw records into Bronze. They then move the files into `processed/`, which serves as the persistent file archive. There is no folder literally named `persistent/` in the implementation.
+This produces a reporting surface with date attributes, customer segments, product attributes, quantities, and gross-price-based sales amounts. Missing price matches result in null calculated amounts, so pricing coverage matters when interpreting revenue.
 
-For a full load, files move after the Bronze append succeeds. For an incremental load, they move after both the Bronze history and Bronze staging writes succeed. This happens before Silver and Gold processing, so an archived file indicates successful ingestion, not necessarily successful completion of the entire pipeline.
+## Sales Dashboard
 
-The archive keeps previously ingested files out of the next landing-folder read. Bronze separately retains their raw records for downstream processing and investigation. Customer, product, and price notebooks read their own source folders directly; they do not implement the order-file move sequence.
+![Sales analytics dashboard](docs/images/sales_analytics_dashboard.png)
 
-The notebooks currently reference `sportsbar-final`, while the S3 screenshot shows `sport-bar-try`. Replace the notebook bucket paths with the bucket configured for your environment.
+The Sales Insights dashboard presents the consolidated business through:
 
-## Full Load
+- Total revenue, total quantity, unique products, and average selling price cards.
+- Revenue by channel, including the acquisition channel.
+- The top five products by revenue.
+- Year, quarter, month, and channel filters.
 
-The full load establishes the historical baseline and consolidates the child's existing data with the parent's reporting tables.
+The captured dashboard displays approximately INR 119.93 billion in revenue, 39.05 million units, and 133 unique products. These are values from the saved screenshot, not live results or a fresh execution of the repository.
 
-### 1. Initialize the Catalog and Parent Tables
+The screenshot also includes an average selling price card. Its measure definition is not included in the supplied notebooks or SQL, so its exact aggregation should be checked in the original dashboard before reuse.
 
-Run `setup_catalog.ipynb` to create the `fmcg` catalog and its three schemas. The shared `utilities.ipynb` defines the schema names used by the processing notebooks.
+A separate dashboard export is available in [fmcg_dashboard.pdf](project-de-fmcg-atlikon/2_dashboarding/fmcg_dashboard.pdf).
 
-Load the parent full-load CSV files into these Delta tables before running the child merges:
+## Databricks Genie Analysis
 
-| Parent source file | Target table |
-| --- | --- |
-| `dim_customers.csv` | `fmcg.gold.dim_customers` |
-| `dim_products.csv` | `fmcg.gold.dim_products` |
-| `dim_gross_price.csv` | `fmcg.gold.dim_gross_price` |
-| `fact_orders.csv` | `fmcg.gold.fact_orders` |
+![Databricks Genie KPI analysis](docs/images/databricks_genie_kpi_analysis.png)
 
-The catalog setup notebook creates the namespaces; it does not import these parent datasets. The child notebooks expect the parent target tables to exist.
+The Genie screenshot demonstrates natural-language exploration of the project's reporting data, including revenue and year-over-year comparisons. This complements the dashboard by letting users ask business questions about the consolidated data.
 
-Run `dim_date_table_creation.ipynb` to create `fmcg.gold.dim_date`. It contains one row per month from January 2024 through December 2025, with year, month, and quarter attributes.
+The screenshot references an `arc` view from the captured environment. When reproducing the project, connect Genie to the reporting view created in your own catalog and verify generated calculations against that view.
 
-### 2. Process Child Dimensions
+The saved analysis is available in [genie_kpi_summary.pdf](docs/genie_kpi_summary.pdf).
 
-Each dimension notebook reads CSV data into Bronze, transforms it in Silver, publishes a child Gold table, and merges standardized records into the matching parent dimension. Child dimension tables are overwritten during these runs; the final parent writes use Delta merges.
+## Repository Structure
 
-| Dataset | Implemented transformations | Parent merge key |
-| --- | --- | --- |
-| Customers | Deduplicate by customer ID; trim and title-case names; correct known city typos; apply explicit city corrections; cast IDs to strings; construct the parent customer label | `customer_code` |
-| Products | Deduplicate by product ID; normalize category casing; correct `Protien` spelling; assign divisions; extract variants; generate SHA-256 product codes from cleaned product names | `product_code` |
-| Gross prices | Parse multiple date formats; convert numeric prices to doubles; make negative prices positive; replace nonnumeric prices with zero; join to product codes | `product_code` in the current merge |
+```text
+.
+|-- README.md
+|-- docs/
+|   |-- images/
+|   |   |-- data_platform_architecture.png
+|   |   |-- aws_s3_data_landing.png
+|   |   |-- databricks_pipeline_workflow.png
+|   |   |-- power_bi_data_model.png
+|   |   |-- sales_analytics_dashboard.png
+|   |   `-- databricks_genie_kpi_analysis.png
+|   `-- genie_kpi_summary.pdf
+`-- project-de-fmcg-atlikon/
+    |-- 0_data/
+    |   |-- 1_parent_company/
+    |   |   |-- full_load/
+    |   |   `-- incremental_load/
+    |   `-- 2_child_company/
+    |       |-- full_load/
+    |       `-- incremental_load/
+    |-- 1_codes/
+    |   |-- 1_setup/
+    |   |-- 2_dimension_data_processing/
+    |   `-- 3_fact_data_processing/
+    |-- 2_dashboarding/
+    `-- resources/
+```
 
-Child customers receive `market = India`, `platform = Sports Bar`, and `channel = Acquisition`. These fields make acquisition activity identifiable in consolidated reporting.
+## Running the Project
 
-The price notebook selects one price per product and year, prioritizing nonzero prices and then the latest month. It renames the selected value to `price_inr` for the parent model. Its final merge currently matches only on `product_code`; extending this to multiple price years requires reviewing that condition against the product-and-year reporting grain.
+Use a Databricks environment with PySpark, Delta Lake, catalog permissions, and access to the configured S3 locations. S3 access must support reading incoming files and moving them to the archive. The notebooks use Databricks-specific APIs such as `dbutils`, notebook widgets, and `%run`.
+
+1. Import `1_codes/` into your Databricks workspace. Update the `%run /Workspace/consolidated_pipeline/1_setup/utilities` references if your import location differs.
+2. Replace the hardcoded S3 bucket paths. Use `fmcg` consistently, or update all catalog references, including hardcoded SQL and staging cleanup statements; changing the widget alone is insufficient.
+3. Run `setup_catalog.ipynb` and import the four parent full-load CSVs into the Gold Delta tables listed above, using date and numeric types appropriate to their columns.
+4. Run `dim_date_table_creation.ipynb`. Extend its date range if your reporting periods go beyond the supplied dataset.
+5. Upload the child customer, product, and gross-price files into their respective S3 folders, and historical order files into `orders/landing/`.
+6. Run the customer and product notebooks, followed by the pricing notebook, then `1_full_load_fact.ipynb`.
+7. Upload the next child order batch into `orders/landing/` and run `2_incremental_load_fact.ipynb`.
+8. Run the `fmcg` enriched-view SQL, configure the reporting connections, and refresh the dashboard after successful consolidation.
+
+When validating a run, compare affected monthly totals in child Gold with their matching parent fact rows, inspect unmatched product and pricing keys, and confirm staging cleanup. The notebooks contain interactive row counts and previews; an automated end-to-end test suite is not included.
+
+Because files are archived before downstream completion, a failed Silver or Gold step requires deliberate recovery from retained tables or archived files. Rerunning with an empty landing folder is not a complete recovery procedure. The implementation also does not propagate source deletions.
+
+## Scope Notes
+
+1. **Incremental processing focuses on `fact_orders`.** This project's incremental implementation targets the child's order facts. Customers, products, and prices use full-refresh processing followed by parent merges. Incremental loading for those datasets would be a separate case requiring its own change-detection rules and update handling.
+
+2. **Parent incremental loading is simplified for this demonstration.** The supplied parent SQL uses a direct `COPY INTO` query to load additional parent order data. This is a shortcut, not a complete production parent incremental pipeline. The project's main case is integrating and incrementally processing the acquired child's data; building the parent's own incremental ingestion pipeline was outside that scope. The sample query also requires replacing its volume-path placeholder and aligning its `arc` catalog reference with the chosen environment.
