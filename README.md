@@ -1,3 +1,195 @@
+# FMCG Data Consolidation Platform
+
+A Databricks lakehouse project that integrates an acquired company's data into its parent company's analytical model using AWS S3, PySpark, Spark SQL, and Delta Lake. The implementation covers historical loading, incremental order processing, data standardization, monthly consolidation, and sales analytics.
+
+## Business Problem
+
+A parent company has acquired a child company, Sports Bar. The parent already has an established reporting model containing customers, products, prices, and monthly sales. The acquired company supplies separate CSV datasets with different field names, inconsistent values, and orders recorded at a more detailed, daily level.
+
+The business needs to bring the child's data into the parent's model and keep that consolidated model current as new child data arrives. New business keys must be inserted, while records matching existing merge keys must be updated. Reporting should then cover the combined business, including the acquisition channel.
+
+This requires more than copying files. The pipeline must clean source data, map child attributes to the parent's schema, resolve product identifiers, and aggregate child orders to the same monthly grain used by the parent.
+
+## Architecture
+
+![Data platform architecture](docs/images/data_platform_architecture.png)
+
+The platform follows a Bronze, Silver, and Gold architecture:
+
+| Component | Responsibility |
+| --- | --- |
+| Source datasets | CSV extracts for customers, products, gross prices, and orders |
+| AWS S3 | Stores incoming child files and archives ingested order files |
+| Bronze | Retains raw records with ingestion timestamps and source-file metadata |
+| Silver | Applies cleaning, deduplication, date parsing, and product mapping |
+| Child Gold | Exposes standardized child dimensions and detailed child orders |
+| Consolidated Gold | Merges child data into parent dimensions and monthly order facts |
+| Serving layer | Provides an enriched SQL view, a Power BI model, sales dashboards, and Genie analysis |
+
+The notebooks use the `fmcg` catalog with `bronze`, `silver`, and `gold` schemas. Some screenshots and an alternative SQL script use `arc`; those names refer to a different workspace configuration. The table references below follow the notebooks.
+
+The repository implements batch ingestion from CSV files. The source-system extraction shown in the diagram is the upstream context; a live OLTP extraction connector is not included.
+
+## AWS S3: Landing and Persistent File Storage
+
+![AWS S3 order landing and processed folders](docs/images/aws_s3_data_landing.png)
+
+The order pipeline separates incoming files from files already ingested:
+
+```text
+s3://<your-bucket>/
+    customers/
+        customers.csv
+    products/
+        products.csv
+    gross_price/
+        gross_price.csv
+    orders/
+        landing/
+            orders_YYYY_MM_DD.csv
+        processed/
+            orders_YYYY_MM_DD.csv
+```
+
+`landing/` is the entry point for new order files. The notebooks read its CSV files, add metadata, and write the raw records into Bronze. They then move the files into `processed/`, which serves as the persistent file archive. There is no folder literally named `persistent/` in the implementation.
+
+For a full load, files move after the Bronze append succeeds. For an incremental load, they move after both the Bronze history and Bronze staging writes succeed. This happens before Silver and Gold processing, so an archived file indicates successful ingestion, not necessarily successful completion of the entire pipeline.
+
+The archive keeps previously ingested files out of the next landing-folder read. Bronze separately retains their raw records for downstream processing and investigation. Customer, product, and price notebooks read their own source folders directly; they do not implement the order-file move sequence.
+
+The notebooks currently reference `sportsbar-final`, while the S3 screenshot shows `sport-bar-try`. Replace the notebook bucket paths with the bucket configured for your environment.
+
+## Full Load
+
+The full load establishes the historical baseline and consolidates the child's existing data with the parent's reporting tables.
+
+### 1. Initialize the Catalog and Parent Tables
+
+Run `setup_catalog.ipynb` to create the `fmcg` catalog and its three schemas. The shared `utilities.ipynb` defines the schema names used by the processing notebooks.
+
+Load the parent full-load CSV files into these Delta tables before running the child merges:
+
+| Parent source file | Target table |
+| --- | --- |
+| `dim_customers.csv` | `fmcg.gold.dim_customers` |
+| `dim_products.csv` | `fmcg.gold.dim_products` |
+| `dim_gross_price.csv` | `fmcg.gold.dim_gross_price` |
+| `fact_orders.csv` | `fmcg.gold.fact_orders` |
+
+The catalog setup notebook creates the namespaces; it does not import these parent datasets. The child notebooks expect the parent target tables to exist.
+
+Run `dim_date_table_creation.ipynb` to create `fmcg.gold.dim_date`. It contains one row per month from January 2024 through December 2025, with year, month, and quarter attributes.
+
+### 2. Process Child Dimensions
+
+Each dimension notebook reads CSV data into Bronze, transforms it in Silver, publishes a child Gold table, and merges standardized records into the matching parent dimension. Child dimension tables are overwritten during these runs; the final parent writes use Delta merges.
+
+| Dataset | Implemented transformations | Parent merge key |
+| --- | --- | --- |
+| Customers | Deduplicate by customer ID; trim and title-case names; correct known city typos; apply explicit city corrections; cast IDs to strings; construct the parent customer label | `customer_code` |
+| Products | Deduplicate by product ID; normalize category casing; correct `Protien` spelling; assign divisions; extract variants; generate SHA-256 product codes from cleaned product names | `product_code` |
+| Gross prices | Parse multiple date formats; convert numeric prices to doubles; make negative prices positive; replace nonnumeric prices with zero; join to product codes | `product_code` in the current merge |
+
+Child customers receive `market = India`, `platform = Sports Bar`, and `channel = Acquisition`. These fields make acquisition activity identifiable in consolidated reporting.
+
+The price notebook selects one price per product and year, prioritizing nonzero prices and then the latest month. It renames the selected value to `price_inr` for the parent model. Its final merge currently matches only on `product_code`; extending this to multiple price years requires reviewing that condition against the product-and-year reporting grain.
+
+Product processing must precede pricing and order processing because both resolve child `product_id` values through `fmcg.silver.products`.
+
+### 3. Ingest Historical Orders into Bronze
+
+`1_full_load_fact.ipynb` reads the historical order CSV files from `orders/landing/` and adds:
+
+- `read_timestamp`
+- `file_name`
+- `file_size`
+
+The records are appended to `fmcg.bronze.orders`, and the input files are moved to `orders/processed/`. Bronze preserves the raw history without deduplication.
+
+### 4. Clean and Merge Orders into Silver
+
+The full-load notebook reads the accumulated Bronze order table and applies these rules:
+
+1. Remove rows with a missing `order_qty`.
+2. Replace nonnumeric customer IDs with the string `999999`.
+3. Remove weekday prefixes from textual dates.
+4. Parse the supported date formats into `order_placement_date`.
+5. Drop duplicates using order ID, date, customer ID, product ID, and quantity.
+6. Cast product IDs to strings and join to the Silver product table to obtain `product_code`.
+
+The product lookup is an inner join, so orders without a matching Silver product are excluded from the joined result.
+
+The result is written to `fmcg.silver.orders`. If the table already exists, a merge updates matching rows and inserts new ones using:
+
+```text
+order_placement_date + order_id + product_code + customer_id
+```
+
+### 5. Publish Detailed Child Gold Orders
+
+The notebook creates or merges into `fmcg.gold.sb_fact_orders`, aligning the field names with the parent model:
+
+| Silver field | Child Gold field |
+| --- | --- |
+| `order_placement_date` | `date` |
+| `customer_id` | `customer_code` |
+| `order_qty` | `sold_quantity` |
+
+Child Gold retains `order_id`, `product_id`, and `product_code`. Its merge key is `date + order_id + product_code + customer_code`, preserving detailed order records before monthly consolidation.
+
+### 6. Consolidate Orders at the Parent's Monthly Grain
+
+The child records are grouped by month start, product code, and customer code. Their quantities are summed, producing one row per:
+
+```text
+month + product_code + customer_code
+```
+
+These monthly rows are merged into `fmcg.gold.fact_orders` using `date + product_code + customer_code`. Matching rows receive the calculated values; new keys are inserted. Parent records outside the incoming keys remain unchanged.
+
+This is an upsert, not an addition to an existing matched quantity. Consolidation therefore assumes that the child keys identify the intended child records in the parent model.
+
+## Incremental Load
+
+`2_incremental_load_fact.ipynb` processes newly delivered child order files while retaining the historical Bronze, Silver, and child Gold tables.
+
+### 1. Land the New Batch
+
+Place the next order CSV files in `orders/landing/`. The provided child incremental dataset contains daily files for December 2025.
+
+### 2. Preserve Raw History and Isolate the Batch
+
+The notebook reads the landing files with ingestion metadata, appends them to `fmcg.bronze.orders`, and overwrites `fmcg.bronze.staging_orders` with only the current batch. It then moves the files to `processed/`.
+
+The permanent Bronze table accumulates history. The staging table limits the next transformation step to the newly arrived records.
+
+### 3. Transform and Merge the Current Batch
+
+The notebook reads Bronze staging, applies the same order-cleaning and product-mapping rules used by the full load, and merges the result into `fmcg.silver.orders`.
+
+It also overwrites `fmcg.silver.staging_orders` with the cleaned current batch. This staging table supplies the records used to update child Gold.
+
+### 4. Update Child Gold
+
+The Silver staging records are renamed to the child Gold schema and merged into `fmcg.gold.sb_fact_orders`. Existing matching order records are updated, and previously unseen keys are inserted.
+
+### 5. Identify Affected Months
+
+The notebook extracts distinct month-start dates from Silver staging and registers them as the temporary view `incremental_months`.
+
+### 6. Recalculate Complete Monthly Totals
+
+For those affected months, the pipeline reads all corresponding records from the updated child Gold fact table, including previously loaded orders. It recalculates monthly quantities by product and customer, then merges those complete totals into the parent fact table.
+
+For example, if a month's existing child orders total 100 units and a new batch adds 20, the parent receives the recalculated total of 120. It does not receive only the new batch's 20 units as a replacement for the month's total.
+
+This is the central consolidation step: the detailed child tables receive batch updates, while the parent receives refreshed monthly totals for the affected periods.
+
+### 7. Remove Staging Tables
+
+After the parent merge, the notebook drops the Bronze and Silver staging tables. Historical records remain in the permanent tables, and the input files remain in the S3 archive.
+
+Although Change Data Feed is enabled on several Delta writes, the implemented incremental path uses landing files and staging tables. It does not consume Delta Change Data Feed or use a streaming checkpoint.
 
 ## Databricks Workflow
 
