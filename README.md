@@ -12,7 +12,7 @@ This requires more than copying files. The pipeline must clean source data, map 
 
 ## Architecture
 
-![Data platform architecture](docs/images/data_platform_architecture.png)
+![Data platform architecture](docs/images/data_platform_architectur.png)
 
 The platform follows a Bronze, Silver, and Gold architecture:
 
